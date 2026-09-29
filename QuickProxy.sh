@@ -106,6 +106,8 @@ else
     OS_FAMILY="debian"
 fi
 
+is_musl() { compgen -G '/lib/ld-musl-*.so.1' >/dev/null; }
+
 svc_log_file() { echo "/var/log/${1}.log"; }   # OpenRC 下由本脚本写入的服务日志
 
 svc_exists() {
@@ -529,7 +531,7 @@ EOF
     local cc
     cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
     if [[ "$cc" == "bbr" ]]; then
-        info "BBR 已开启 ✔（拥塞控制：$cc，队列：$(sysctl -n net.core.default_qdisc)）"
+        info "BBR 已开启 ✔（拥塞控制：$cc，队列：$(sysctl -n net.core.default_qdisc 2>/dev/null || echo 未知)）"
     else
         warn "BBR 开启失败，当前算法：$cc（部分 OpenVZ/LXC 虚拟化不支持）"
     fi
@@ -670,14 +672,23 @@ install_singbox_github() {
     [[ "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][A-Za-z0-9.]+)?$ ]] \
         || err "获取 sing-box 版本号失败：'${ver}'（可能无法访问 GitHub；可稍后重试，或改用 APT 源）"
 
-    url="https://github.com/SagerNet/sing-box/releases/download/v${ver}/sing-box-${ver}-linux-${arch}.tar.gz"
-    info "下载 sing-box v${ver} (${arch})..."
+    local base="https://github.com/SagerNet/sing-box/releases/download/v${ver}/sing-box-${ver}-linux-${arch}"
     tmp=$(mktemp -d)
+    url="${base}.tar.gz"
+    # musl 系统（Alpine）：1.13+ 的通用包依赖 glibc，优先使用 -musl 包；旧版本没有 -musl 包，但通用包为静态编译
+    if is_musl && curl -fsSLI -o /dev/null "${base}-musl.tar.gz" 2>/dev/null; then
+        url="${base}-musl.tar.gz"
+        info "下载 sing-box v${ver} (${arch}, musl)..."
+    else
+        info "下载 sing-box v${ver} (${arch})..."
+    fi
     curl -fL --retry 3 -o "${tmp}/sb.tar.gz" "$url" || { rm -rf "$tmp"; err "下载失败：$url"; }
     tar -xzf "${tmp}/sb.tar.gz" -C "$tmp" || { rm -rf "$tmp"; err "解压失败，下载文件可能已损坏"; }
     local bin
     bin=$(find "$tmp" -type f -name sing-box | head -n1 || true)
     [[ -n "$bin" ]] || { rm -rf "$tmp"; err "压缩包内未找到 sing-box 可执行文件"; }
+    chmod +x "$bin"
+    "$bin" version >/dev/null 2>&1 || { rm -rf "$tmp"; err "下载的 sing-box 无法在本系统运行（${url##*/}），请换用其他版本（SB_VERSION）"; }
     install -m 755 "$bin" /usr/local/bin/sing-box
     rm -rf "$tmp"
 
