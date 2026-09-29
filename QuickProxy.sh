@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================
-# VLESS-Reality / Hysteria2 一键安装脚本 —— 适用于 Debian 10/11/12+
+# VLESS-Reality / Hysteria2 一键安装脚本 —— 适用于 Debian 10/11/12+、Alpine 3.21+
 #   协议：VLESS+Reality（Xray 或 sing-box）、Hysteria2（sing-box）、两者同时部署
 #   功能：开启 BBR、自动生成密钥/证书、输出分享链接
 #
@@ -10,9 +10,24 @@
 # 进阶（预先指定后将跳过对应提问，适合自动化）：
 #   PROTO=reality|hy2|both   CORE=xray|singbox
 #   PORT=xxxx (Reality/TCP)  HY2_PORT=xxxx (Hysteria2/UDP)  SNI=www.microsoft.com
-#   SB_SOURCE=github|apt     SB_VERSION=1.12.0
+#   SB_SOURCE=github|apt     SB_VERSION=1.12.0   （Alpine 仅支持 github）
 # 子命令：install | info | restart | uninstall
+#
+# Alpine 默认没有 bash：用 sh 运行本文件时会自动 apk add bash 后切换到 bash；
+# 若通过管道运行，请先执行：apk add bash curl
 # =============================================================
+
+# 以下几行需兼容 POSIX sh（Alpine 的 ash），在切换到 bash 之前不能使用 bash 语法
+if [ -z "${BASH_VERSION:-}" ]; then
+    if ! command -v bash >/dev/null 2>&1 && command -v apk >/dev/null 2>&1; then
+        echo "[INFO] 未检测到 bash，正在安装（apk add bash）..."
+        apk add --no-cache bash >/dev/null || { echo "[ERROR] 安装 bash 失败，请手动执行：apk add bash" >&2; exit 1; }
+    fi
+    command -v bash >/dev/null 2>&1 || { echo "[ERROR] 本脚本需要 bash" >&2; exit 1; }
+    if [ -f "$0" ]; then exec bash "$0" "$@"; fi
+    echo "[ERROR] 请使用 bash 运行本脚本（Alpine 请先执行：apk add bash）" >&2
+    exit 1
+fi
 
 set -euo pipefail
 
@@ -77,11 +92,80 @@ check_enums() {
     case "$SB_SOURCE" in ""|github|apt) ;; *) err "SB_SOURCE 只能是 github 或 apt，收到：$SB_SOURCE" ;; esac
 }
 
+# ---------- 系统 / 服务管理抽象：systemd（Debian）与 OpenRC（Alpine） ----------
+if command -v systemctl >/dev/null 2>&1; then
+    INIT_SYS="systemd"
+elif command -v rc-service >/dev/null 2>&1; then
+    INIT_SYS="openrc"
+else
+    INIT_SYS=""
+fi
+if [[ -f /etc/alpine-release ]]; then
+    OS_FAMILY="alpine"
+else
+    OS_FAMILY="debian"
+fi
+
+svc_log_file() { echo "/var/log/${1}.log"; }   # OpenRC 下由本脚本写入的服务日志
+
+svc_exists() {
+    if [[ "$INIT_SYS" == "openrc" ]]; then [[ -f "/etc/init.d/$1" ]]
+    else systemctl cat "${1}.service" >/dev/null 2>&1; fi
+}
+svc_active() {
+    if [[ "$INIT_SYS" == "openrc" ]]; then rc-service "$1" status >/dev/null 2>&1
+    else systemctl is-active --quiet "$1" 2>/dev/null; fi
+}
+svc_enabled() {
+    if [[ "$INIT_SYS" == "openrc" ]]; then
+        rc-update show default 2>/dev/null | awk '{print $1}' | grep -qx "$1"
+    else systemctl is-enabled --quiet "$1" 2>/dev/null; fi
+}
+svc_enable() {
+    if [[ "$INIT_SYS" == "openrc" ]]; then rc-update add "$1" default >/dev/null 2>&1
+    else systemctl enable "$1" >/dev/null 2>&1; fi
+}
+svc_disable() {
+    if [[ "$INIT_SYS" == "openrc" ]]; then rc-update del "$1" default >/dev/null 2>&1
+    else systemctl disable "$1" >/dev/null 2>&1; fi
+}
+svc_stop() {
+    if [[ "$INIT_SYS" == "openrc" ]]; then rc-service "$1" stop >/dev/null 2>&1
+    else systemctl stop "$1" >/dev/null 2>&1; fi
+}
+svc_restart() {
+    if [[ "$INIT_SYS" == "openrc" ]]; then rc-service "$1" restart
+    else systemctl restart "$1"; fi
+}
+svc_reload_units() { if [[ "$INIT_SYS" == "systemd" ]]; then systemctl daemon-reload; fi; }
+svc_status() {
+    if [[ "$INIT_SYS" == "openrc" ]]; then
+        rc-service "$1" status || true
+        tail -n 5 "$(svc_log_file "$1")" 2>/dev/null || true
+    else systemctl --no-pager -n 5 status "$1" || true; fi
+}
+# svc_logs 服务名 [行数]
+svc_logs() {
+    if [[ "$INIT_SYS" == "openrc" ]]; then tail -n "${2:-20}" "$(svc_log_file "$1")" 2>/dev/null || true
+    else journalctl -u "$1" --no-pager -n "${2:-20}" 2>/dev/null || true; fi
+}
+# 给用户看的查看日志命令
+svc_log_cmd() {
+    if [[ "$INIT_SYS" == "openrc" ]]; then echo "tail -f $(svc_log_file "$1")"
+    else echo "journalctl -u $1 -f"; fi
+}
+# 服务的运行用户（为空视为 root）
+svc_user() {
+    if [[ "$INIT_SYS" == "openrc" ]]; then
+        sed -n 's/^command_user="\{0,1\}\([^:"]*\).*/\1/p' "/etc/init.d/$1" 2>/dev/null | head -n1 || true
+    else systemctl show -p User --value "$1" 2>/dev/null || true; fi
+}
+
 # 按服务运行用户收紧配置文件权限（含私钥/密码）
 secure_file() {
     local f="$1" svc="$2" u g
     [[ -e "$f" ]] || return 0
-    u=$(systemctl show -p User --value "$svc" 2>/dev/null || true)
+    u=$(svc_user "$svc")
     if [[ -z "$u" || "$u" == "root" ]]; then
         chmod 600 "$f"
     elif id "$u" >/dev/null 2>&1; then
@@ -92,8 +176,6 @@ secure_file() {
         chmod 644 "$f"   # 动态用户等无法预知的情况，保证服务可读
     fi
 }
-
-unit_exists() { systemctl cat "${1}.service" >/dev/null 2>&1; }
 
 # ---------- 并发锁：防止两个脚本实例同时改动配置和服务 ----------
 acquire_lock() {
@@ -120,9 +202,9 @@ begin_txn() {
         if [[ -e "$f" ]]; then cp -a "$f" "${TXN_DIR}/${i}"; else touch "${TXN_DIR}/${i}.absent"; fi
     done
     for svc in xray sing-box; do
-        if unit_exists "$svc"; then
-            if systemctl is-active --quiet "$svc" 2>/dev/null; then touch "${TXN_DIR}/${svc}.active"; fi
-            if systemctl is-enabled --quiet "$svc" 2>/dev/null; then touch "${TXN_DIR}/${svc}.enabled"; fi
+        if svc_exists "$svc"; then
+            if svc_active "$svc"; then touch "${TXN_DIR}/${svc}.active"; fi
+            if svc_enabled "$svc"; then touch "${TXN_DIR}/${svc}.enabled"; fi
         fi
     done
     TXN_ACTIVE=1
@@ -136,7 +218,7 @@ rollback_txn() {
     warn "安装失败，正在回滚到安装前的状态..."
     local i f svc restored=0
     for svc in xray sing-box; do
-        if unit_exists "$svc"; then systemctl stop "$svc" >/dev/null 2>&1; fi
+        if svc_exists "$svc"; then svc_stop "$svc"; fi
     done
     for i in "${!TXN_FILES[@]}"; do
         f="${TXN_FILES[$i]}"
@@ -146,22 +228,22 @@ rollback_txn() {
             rm -f "$f"
         fi
     done
-    systemctl daemon-reload >/dev/null 2>&1
+    svc_reload_units >/dev/null 2>&1
     for svc in xray sing-box; do
-        unit_exists "$svc" || continue
+        svc_exists "$svc" || continue
         if [[ -e "${TXN_DIR}/${svc}.enabled" ]]; then
-            systemctl enable "$svc" >/dev/null 2>&1
+            svc_enable "$svc"
         else
-            systemctl disable "$svc" >/dev/null 2>&1
+            svc_disable "$svc"
         fi
         if [[ -e "${TXN_DIR}/${svc}.active" ]]; then
-            systemctl restart "$svc" >/dev/null 2>&1
+            svc_restart "$svc" >/dev/null 2>&1
             restored=1
             command sleep 2
-            if systemctl is-active --quiet "$svc"; then
+            if svc_active "$svc"; then
                 info "已恢复原来的 ${svc} 节点 ✔（原节点信息不变）"
             else
-                warn "尝试恢复 ${svc} 失败，请查看：journalctl -u ${svc} -n 50"
+                warn "尝试恢复 ${svc} 失败，请查看日志：$(svc_log_cmd "$svc")"
             fi
         fi
     done
@@ -184,11 +266,25 @@ check_env() {
     [[ $EUID -eq 0 ]] || err "请使用 root 用户运行（或 sudo -i 后再执行）"
     if [[ -f /etc/os-release ]]; then
         . /etc/os-release
-        if [[ "${ID:-}" != "debian" && "${ID_LIKE:-}" != *debian* ]]; then
-            warn "检测到非 Debian 系统（${PRETTY_NAME:-unknown}），脚本可能无法正常工作"
+        if [[ "${ID:-}" == "alpine" ]]; then
+            local amaj amin
+            amaj=${VERSION_ID:-0}; amaj=${amaj%%.*}; amin=${VERSION_ID:-0.0}; amin=${amin#*.}; amin=${amin%%.*}
+            if [[ "$amaj" =~ ^[0-9]+$ && "$amin" =~ ^[0-9]+$ ]] && (( amaj < 3 || (amaj == 3 && amin < 21) )); then
+                warn "检测到 Alpine ${VERSION_ID}，本脚本针对 Alpine 3.21+ 测试，旧版本可能无法正常工作"
+            fi
+        elif [[ "${ID:-}" != "debian" && "${ID_LIKE:-}" != *debian* ]]; then
+            warn "检测到非 Debian/Alpine 系统（${PRETTY_NAME:-unknown}），脚本可能无法正常工作"
         fi
     fi
-    command -v systemctl >/dev/null || err "未检测到 systemd"
+    case "$INIT_SYS" in
+        systemd) ;;
+        openrc)
+            if [[ ! -e /run/openrc/softlevel ]]; then
+                warn "OpenRC 尚未启动（常见于容器），服务可能无法启动；可先执行：openrc default"
+            fi
+            ;;
+        *) err "未检测到 systemd 或 OpenRC" ;;
+    esac
 }
 
 # ---------------------- 选择协议 / 内核 ----------------------
@@ -233,6 +329,11 @@ choose_core() {
 
 install_deps() {
     info "安装依赖..."
+    if [[ "$OS_FAMILY" == "alpine" ]]; then
+        apk update
+        apk add curl openssl ca-certificates unzip tar iproute2 iproute2-ss coreutils
+        return
+    fi
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -y
     apt-get install -y curl openssl ca-certificates unzip gnupg iproute2
@@ -278,6 +379,19 @@ ask_port() {
     printf -v "$var" '%s' "$cur"
 }
 
+# 解析域名的第一个 IPv4 地址（兼容 glibc 与 musl/busybox）
+resolve_ipv4() {
+    local ip=""
+    ip=$(getent ahostsv4 "$1" 2>/dev/null | awk 'NR==1{print $1}' || true)
+    if [[ -z "$ip" ]]; then
+        ip=$(getent hosts "$1" 2>/dev/null | awk '$1 ~ /^[0-9]+(\.[0-9]+){3}$/ {print $1; exit}' || true)
+    fi
+    if [[ -z "$ip" ]] && command -v nslookup >/dev/null; then
+        ip=$(nslookup "$1" 2>/dev/null | awk '/^Name:/ {f=1; next} f && /^Address/ {sub(/^Address( [0-9]+)?: */, ""); if ($1 ~ /^[0-9]+(\.[0-9]+){3}$/) {print $1; exit}}' || true)
+    fi
+    echo "$ip"
+}
+
 # ---------------------- 交互式参数 ----------------------
 prompt_settings() {
     echo
@@ -314,7 +428,7 @@ prompt_settings() {
             fi
             get_ip
             local resolved
-            resolved=$(getent ahostsv4 "$HY2_DOMAIN" 2>/dev/null | awk 'NR==1{print $1}' || true)
+            resolved=$(resolve_ipv4 "$HY2_DOMAIN")
             if [[ -z "$resolved" ]]; then
                 warn "域名 ${HY2_DOMAIN} 暂未解析，证书申请会失败，请先添加 A 记录指向 ${SERVER_IP}"
             elif [[ "$resolved" != "$SERVER_IP" ]]; then
@@ -323,6 +437,23 @@ prompt_settings() {
         fi
     fi
 
+    if [[ "$CORE" == "singbox" && "$OS_FAMILY" == "alpine" && "$SB_SOURCE" == "apt" ]]; then
+        warn "Alpine 不支持 APT 源，改为从 GitHub 安装 sing-box"
+        SB_SOURCE="github"
+    fi
+    if [[ "$CORE" == "singbox" && -z "$SB_SOURCE" && "$OS_FAMILY" == "alpine" ]]; then
+        echo
+        echo "sing-box 安装来源："
+        echo "  1) GitHub 最新正式版（默认）"
+        echo "  2) GitHub 指定版本"
+        ask "请选择 [1-2，回车默认 1]: " 1
+        SB_SOURCE="github"
+        if [[ "$ANSWER" == "2" ]]; then
+            ask "输入版本号（如 1.12.0）: " ""
+            [[ -n "$ANSWER" ]] || err "版本号不能为空"
+            SB_VERSION="$ANSWER"
+        fi
+    fi
     if [[ "$CORE" == "singbox" && -z "$SB_SOURCE" ]]; then
         echo
         echo "sing-box 安装来源："
@@ -384,7 +515,16 @@ net.core.rmem_max=7500000
 net.core.wmem_max=7500000
 EOF
     fi
-    sysctl --system >/dev/null 2>&1 || true
+    if ! sysctl --system >/dev/null 2>&1; then
+        # busybox sysctl 不支持 --system，逐个加载
+        local f
+        for f in /etc/sysctl.d/99-bbr.conf /etc/sysctl.d/99-udp-buffer.conf; do
+            if [[ -f "$f" ]]; then sysctl -p "$f" >/dev/null 2>&1 || true; fi
+        done
+    fi
+    if [[ "$INIT_SYS" == "openrc" && -f /etc/init.d/sysctl ]]; then
+        rc-update add sysctl boot >/dev/null 2>&1 || true   # 保证重启后 /etc/sysctl.d 仍被加载
+    fi
 
     local cc
     cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
@@ -407,9 +547,87 @@ run_xray_installer() {
     return "$rc"
 }
 
+# OpenRC 启动脚本：write_openrc_service 服务名 程序 参数 工作目录
+write_openrc_service() {
+    local name="$1" cmd="$2" args="$3" dir="$4" log
+    log=$(svc_log_file "$name")
+    mkdir -p /etc/init.d
+    cat > "/etc/init.d/${name}" <<EOF
+#!/sbin/openrc-run
+# 由 QuickProxy 脚本生成
+name="${name}"
+description="${name} service"
+supervisor="supervise-daemon"
+command="${cmd}"
+command_args="${args}"
+directory="${dir}"
+output_log="${log}"
+error_log="${log}"
+respawn_delay=10
+respawn_max=0
+rc_ulimit="-n 1048576"
+extra_started_commands="reload"
+
+depend() {
+    after net dns firewall
+    use net
+}
+
+reload() {
+    ebegin "Reloading \${name}"
+    supervise-daemon "\${RC_SVCNAME}" --signal HUP
+    eend \$?
+}
+EOF
+    chmod 755 "/etc/init.d/${name}"
+    touch "$log"; chmod 600 "$log"
+}
+
+# Alpine：官方 Xray-install 脚本依赖 systemd，这里直接下载发布包并写 OpenRC 服务
+install_xray_alpine() {
+    local arch tmp zip sum want f
+    case "$(uname -m)" in
+        x86_64|amd64)  arch="64" ;;
+        aarch64|arm64) arch="arm64-v8a" ;;
+        armv7l|armv7)  arch="arm32-v7a" ;;
+        i386|i686)     arch="32" ;;
+        *) err "不支持的 CPU 架构：$(uname -m)" ;;
+    esac
+    local url="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${arch}.zip"
+    tmp=$(mktemp -d); zip="${tmp}/xray.zip"
+    info "下载 Xray (${arch})..."
+    if ! curl -fL --retry 3 -o "$zip" "$url" || ! curl -fsSL --retry 3 -o "${zip}.dgst" "${url}.dgst"; then
+        rm -rf "$tmp"; err "Xray 下载失败（服务器可能无法访问 GitHub）"
+    fi
+    want=$(awk -F'= *' 'toupper($1) ~ /SHA2-?256/ {print $2; exit}' "${zip}.dgst" | tr -d '[:space:]')
+    sum=$(sha256sum "$zip" | awk '{print $1}')
+    [[ -n "$want" && "$want" == "$sum" ]] || { rm -rf "$tmp"; err "Xray 安装包 SHA256 校验失败"; }
+    unzip -oq "$zip" -d "$tmp" || { rm -rf "$tmp"; err "解压失败，下载文件可能已损坏"; }
+    if svc_exists xray && svc_active xray; then svc_stop xray; fi
+    install -m 755 "${tmp}/xray" /usr/local/bin/xray
+    mkdir -p /usr/local/share/xray "$(dirname "$XRAY_CONF")"
+    for f in geoip.dat geosite.dat; do
+        if [[ -f "${tmp}/${f}" ]]; then install -m 644 "${tmp}/${f}" "/usr/local/share/xray/${f}"; fi
+    done
+    rm -rf "$tmp"
+    write_openrc_service xray /usr/local/bin/xray "run -config ${XRAY_CONF}" /usr/local/etc/xray
+}
+
+uninstall_xray_alpine() {
+    svc_stop xray || true
+    svc_disable xray || true
+    rm -f /usr/local/bin/xray /etc/init.d/xray "$(svc_log_file xray)"
+    rm -rf /usr/local/share/xray /usr/local/etc/xray
+}
+
 install_xray() {
-    info "安装 Xray（官方安装脚本）..."
-    run_xray_installer install || err "Xray 安装失败（服务器可能无法访问 GitHub，或安装脚本报错）"
+    if [[ "$OS_FAMILY" == "alpine" || "$INIT_SYS" == "openrc" ]]; then
+        info "安装 Xray（GitHub 发布包 + OpenRC 服务）..."
+        install_xray_alpine
+    else
+        info "安装 Xray（官方安装脚本）..."
+        run_xray_installer install || err "Xray 安装失败（服务器可能无法访问 GitHub，或安装脚本报错）"
+    fi
     command -v xray >/dev/null || err "Xray 安装失败"
     info "Xray 版本：$(xray version | head -n1)"
 }
@@ -464,6 +682,11 @@ install_singbox_github() {
     rm -rf "$tmp"
 
     mkdir -p "$SB_DIR" /var/lib/sing-box
+    if [[ "$INIT_SYS" == "openrc" ]]; then
+        write_openrc_service sing-box /usr/local/bin/sing-box \
+            "-D /var/lib/sing-box -c ${SB_CONF} run" /var/lib/sing-box
+        return 0
+    fi
     cat > /etc/systemd/system/sing-box.service <<EOF
 [Unit]
 Description=sing-box service
@@ -485,7 +708,7 @@ EOF
 }
 
 install_singbox() {
-    if [[ "${SB_SOURCE:-github}" == "apt" ]]; then
+    if [[ "${SB_SOURCE:-github}" == "apt" && "$OS_FAMILY" != "alpine" ]]; then
         install_singbox_apt
     else
         install_singbox_github
@@ -746,23 +969,23 @@ open_firewall() {
 stop_other_core() {
     local other
     if [[ "$SERVICE" == "xray" ]]; then other="sing-box"; else other="xray"; fi
-    if unit_exists "$other"; then
-        if systemctl is-active --quiet "$other" 2>/dev/null; then
+    if svc_exists "$other"; then
+        if svc_active "$other"; then
             warn "检测到 ${other} 正在运行，将停止并禁用它，以免端口冲突"
         fi
-        systemctl stop "$other" 2>/dev/null || true
-        systemctl disable "$other" >/dev/null 2>&1 || true
+        svc_stop "$other" || true
+        svc_disable "$other" || true
     fi
     return 0
 }
 
 start_service() {
-    systemctl daemon-reload
-    systemctl enable "$SERVICE" >/dev/null 2>&1
-    systemctl restart "$SERVICE"
+    svc_reload_units
+    svc_enable "$SERVICE" || true
+    svc_restart "$SERVICE"
     sleep 3
-    if ! systemctl is-active --quiet "$SERVICE"; then
-        journalctl -u "$SERVICE" --no-pager -n 20 || true
+    if ! svc_active "$SERVICE"; then
+        svc_logs "$SERVICE" 20
         err "${SERVICE} 启动失败"
     fi
     info "${SERVICE} 已启动并设置开机自启 ✔"
@@ -788,7 +1011,7 @@ verify_listening() {
     if [[ "$PROTO" != "hy2" ]]; then
         if wait_listen tcp "$PORT" 10; then info "Reality ${PORT}/tcp 监听正常 ✔"
         else
-            journalctl -u "$SERVICE" --no-pager -n 20 2>/dev/null || true
+            svc_logs "$SERVICE" 20
             err "服务已启动但 ${PORT}/tcp 未在监听"
         fi
     fi
@@ -798,9 +1021,9 @@ verify_listening() {
         else
             warn "未检测到 ${HY2_PORT}/udp 监听。"
             if [[ "$HY2_MODE" == "acme" ]]; then
-                warn "域名证书可能仍在申请中或申请失败，请查看：journalctl -u ${SERVICE} -f（检查域名解析与 80 端口）"
+                warn "域名证书可能仍在申请中或申请失败，请查看：$(svc_log_cmd "$SERVICE")（检查域名解析与 80 端口）"
             else
-                journalctl -u "$SERVICE" --no-pager -n 20 2>/dev/null || true
+                svc_logs "$SERVICE" 20
                 err "服务已启动但 ${HY2_PORT}/udp 未在监听"
             fi
         fi
@@ -913,10 +1136,10 @@ do_restart() {
     acquire_lock
     local found=0 svc
     for svc in xray sing-box; do
-        if unit_exists "$svc" && systemctl is-enabled --quiet "$svc" 2>/dev/null; then
+        if svc_exists "$svc" && svc_enabled "$svc"; then
             found=1
-            systemctl restart "$svc" && info "${svc} 已重启"
-            systemctl --no-pager -n 5 status "$svc" || true
+            svc_restart "$svc" && info "${svc} 已重启"
+            svc_status "$svc"
         fi
     done
     if (( ! found )); then warn "未发现已启用的 xray / sing-box 服务"; fi
@@ -941,17 +1164,22 @@ do_uninstall() {
 
     if (( rm_xray )); then
         info "卸载 Xray..."
-        run_xray_installer remove --purge || warn "Xray 卸载脚本执行失败（可能无法访问 GitHub），请手动检查"
+        if [[ "$OS_FAMILY" == "alpine" || "$INIT_SYS" == "openrc" ]]; then
+            uninstall_xray_alpine
+        else
+            run_xray_installer remove --purge || warn "Xray 卸载脚本执行失败（可能无法访问 GitHub），请手动检查"
+        fi
     fi
     if (( rm_sb )); then
         info "卸载 sing-box..."
-        systemctl stop sing-box 2>/dev/null || true
-        systemctl disable sing-box 2>/dev/null || true
-        apt-get purge -y sing-box 2>/dev/null || true
+        svc_stop sing-box || true
+        svc_disable sing-box || true
+        if command -v apt-get >/dev/null; then apt-get purge -y sing-box 2>/dev/null || true; fi
         rm -f /etc/apt/sources.list.d/sagernet.sources /etc/apt/keyrings/sagernet.asc
         rm -f /usr/local/bin/sing-box /etc/systemd/system/sing-box.service
+        if [[ "$INIT_SYS" == "openrc" ]]; then rm -f /etc/init.d/sing-box "$(svc_log_file sing-box)"; fi
         rm -rf /etc/sing-box /var/lib/sing-box
-        systemctl daemon-reload
+        svc_reload_units
     fi
 
     # 只删除与被卸载内核对应的节点信息
